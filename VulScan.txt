@@ -1,0 +1,172 @@
+<#
+VulnScan.ps1
+Lightweight Windows vulnerability discovery / triage script.
+Save to GitHub and run as Administrator on systems you are authorized to test.
+
+Output: Creates C:\VulnScan\<timestamp>\ with text artifacts and a zip.
+#>
+
+# --- Setup output folder and timestamp ---
+$OutRoot = "C:\VulnScan"                                 # base output folder
+New-Item -Path $OutRoot -ItemType Directory -Force | Out-Null
+$timestamp = (Get-Date).ToString("yyyyMMdd_HHmmss")      # timestamp for uniqueness
+$Out = Join-Path $OutRoot $timestamp
+New-Item -Path $Out -ItemType Directory -Force | Out-Null
+
+# Helper: save text output to a file
+function Save-Text($name, $obj) {
+    $path = Join-Path $Out ("$name.txt")
+    if ($obj -is [string]) { $obj | Out-File -FilePath $path -Encoding utf8 } else { $obj | Out-File -FilePath $path -Encoding utf8 }
+    Write-Output "Saved: $path"
+}
+
+Write-Output "=== VulnScan started at $(Get-Date) ==="
+
+# -------------------------
+# 1) Basic system info
+# -------------------------
+Save-Text "systeminfo" (systeminfo)                      # Windows system information
+Save-Text "hostname" (hostname)                          # machine name
+Save-Text "whoami" (whoami)                              # running user
+Try { Save-Text "uptime" ((Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToString()) } Catch {}
+
+# -------------------------
+# 2) Installed updates / hotfixes
+# -------------------------
+Try {
+    # lists installed hotfixes/patches (may be slow)
+    Save-Text "hotfixes" (Get-HotFix | Select-Object HotFixID,Description,InstalledOn | Format-Table -AutoSize | Out-String)
+} Catch { Save-Text "hotfixes_error" $_.Exception.Message }
+
+# -------------------------
+# 3) OS info & features
+# -------------------------
+Save-Text "os" (Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber,OSArchitecture | Format-List | Out-String)
+Try { Save-Text "windows_features" (Get-WindowsFeature | Where-Object {$_.Installed -eq $true} | Format-Table -AutoSize | Out-String) } Catch {}
+
+# -------------------------
+# 4) Network connections & listening ports
+# -------------------------
+Try {
+    Save-Text "listening_ports" (Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess | Format-Table -AutoSize | Out-String)
+    Save-Text "established_by_remote" (Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue | Group-Object RemoteAddress | Sort-Object Count -Descending | Select-Object -First 100 | Out-String)
+} Catch { Save-Text "net_error" $_.Exception.Message }
+
+# -------------------------
+# 5) Processes (top CPU)
+# -------------------------
+Save-Text "process_top" (Get-Process | Sort-Object CPU -Descending | Select-Object -First 50 Id,ProcessName,CPU,WorkingSet | Format-Table -AutoSize | Out-String)
+
+# -------------------------
+# 6) Firewall summary & sample rules
+# -------------------------
+Try {
+    Save-Text "firewall_profiles" (Get-NetFirewallProfile | Select-Object Name,Enabled,DefaultInboundAction,DefaultOutboundAction | Format-Table -AutoSize | Out-String)
+    Save-Text "firewall_rules_sample" (Get-NetFirewallRule -PolicyStore ActiveStore | Select-Object -First 200 DisplayName,Direction,Action,Enabled,Profile,RemoteAddress,LocalPort | Format-Table -AutoSize | Out-String)
+} Catch { Save-Text "firewall_error" $_.Exception.Message }
+
+# -------------------------
+# 7) SMB settings & shares (SMBv1 check)
+# -------------------------
+Try {
+    if (Get-Command Get-SmbServerConfiguration -ErrorAction SilentlyContinue) {
+        Save-Text "smb_config" (Get-SmbServerConfiguration | Format-List | Out-String)  # server SMB config
+        Save-Text "smb_shares" (Get-SmbShare | Select-Object Name,Path,Description,ScopeName | Format-Table -AutoSize | Out-String)
+    } else {
+        Save-Text "smb_unavailable" "Get-SmbServerConfiguration not present."
+    }
+    Try { Save-Text "smb1_feature" (Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue | Out-String) } Catch {}
+} Catch { Save-Text "smb_error" $_.Exception.Message }
+
+# -------------------------
+# 8) RDP status & NLA
+# -------------------------
+Try {
+    $ts = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -ErrorAction SilentlyContinue
+    $nla = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -ErrorAction SilentlyContinue
+    Save-Text "rdp_status" ("fDenyTSConnections={0}; UserAuthentication(NLA)={1}" -f ($ts.fDenyTSConnections -as [string]), ($nla.UserAuthentication -ne $null ? $nla.UserAuthentication : "N/A"))
+} Catch { Save-Text "rdp_error" $_.Exception.Message }
+
+# -------------------------
+# 9) Local admins & users
+# -------------------------
+Try {
+    if (Get-Command Get-LocalGroupMember -ErrorAction SilentlyContinue) {
+        Save-Text "local_admins" (Get-LocalGroupMember -Group "Administrators" | Format-Table -AutoSize | Out-String)
+        Save-Text "local_users" (Get-LocalUser | Select-Object Name,Enabled,LastLogon | Format-Table -AutoSize | Out-String)
+    } else {
+        Save-Text "local_admins_legacy" (net localgroup administrators | Out-String)
+    }
+} Catch { Save-Text "local_users_error" $_.Exception.Message }
+
+# -------------------------
+# 10) Services, autoruns, scheduled tasks
+# -------------------------
+Save-Text "running_services" (Get-Service | Where-Object {$_.Status -eq 'Running'} | Select-Object Name,DisplayName | Format-Table -AutoSize | Out-String)
+Try { Save-Text "registry_run_hkcu" (Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue | Format-List | Out-String) } Catch {}
+Try { Save-Text "registry_run_hklm" (Get-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run" -ErrorAction SilentlyContinue | Format-List | Out-String) } Catch {}
+Try { schtasks /Query /FO LIST /V > (Join-Path $Out "scheduled_tasks.txt") } Catch {}
+
+# -------------------------
+# 11) WinRM / PowerShell remoting
+# -------------------------
+Try { Save-Text "winrm_service" (Get-Service -Name WinRM -ErrorAction SilentlyContinue | Format-List | Out-String) } Catch {}
+
+# -------------------------
+# 12) Schannel / TLS registry checks (simple)
+# -------------------------
+$schKeys = @(
+    "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.0\Server",
+    "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Server",
+    "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Server"
+)
+$schOut = @()
+foreach ($k in $schKeys) {
+    if (Test-Path $k) { $schOut += "$k -> " + (Get-ItemProperty -Path $k | Out-String) } else { $schOut += "$k -> (missing)" }
+}
+Save-Text "schannel_tls" ($schOut -join "`n")
+
+# -------------------------
+# 13) IIS quick check (if installed)
+# -------------------------
+Try {
+    if (Get-WindowsFeature -Name Web-Server -ErrorAction SilentlyContinue | Where-Object {$_.Installed}) {
+        Import-Module WebAdministration -ErrorAction SilentlyContinue
+        Save-Text "iis_sites" (Get-Website | Select-Object Name,State,Bindings | Format-Table -AutoSize | Out-String)
+        Save-Text "iis_bindings" (Get-WebBinding | Select-Object protocol,bindingInformation | Format-Table -AutoSize | Out-String)
+    } else {
+        Save-Text "iis_status" "IIS not installed or feature not present."
+    }
+} Catch { Save-Text "iis_error" $_.Exception.Message }
+
+# -------------------------
+# 14) Quick heuristics / triage summary
+# -------------------------
+$summary = @()
+Try {
+    $latest = Get-HotFix | Sort-Object InstalledOn -Descending | Select-Object -First 5
+    $summary += "Top recent hotfixes:"
+    $summary += ($latest | ForEach-Object { "$($_.HotFixID) - $($_.InstalledOn)" })
+} Catch {}
+Try {
+    $s1 = (Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue)
+    if ($s1 -and $s1.State -eq "Enabled") { $summary += "WARNING: SMBv1 appears ENABLED." }
+} Catch {}
+$fwOff = Get-NetFirewallProfile | Where-Object {$_.Enabled -eq $false} | Select-Object -ExpandProperty Name -ErrorAction SilentlyContinue
+if ($fwOff) { $summary += "WARNING: Firewall profiles disabled: $($fwOff -join ', ')" }
+Try { if ((Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -ErrorAction SilentlyContinue).fDenyTSConnections -eq 0) { $summary += "RDP enabled on host (fDenyTSConnections=0)." } } Catch {}
+Save-Text "quick_summary" ($summary -join "`n")
+
+# -------------------------
+# 15) Zip results into archive
+# -------------------------
+Try {
+    $zipFile = Join-Path $OutRoot ("vulnscan_$timestamp.zip")
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::CreateFromDirectory($Out, $zipFile)
+    Write-Output "Created zip: $zipFile"
+} Catch {
+    Write-Output "Failed to create zip: $_"
+}
+
+Write-Output "=== VulnScan finished at $(Get-Date). Results: $Out ==="
